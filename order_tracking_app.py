@@ -10,6 +10,7 @@ from flask_sqlalchemy import SQLAlchemy
 import os
 from flask import jsonify
 from collections import defaultdict, Counter
+from flask import jsonify
 
 app = Flask(__name__)
 
@@ -45,6 +46,8 @@ class Product(ProductBase):
     order_id = Column(String)
     amount = Column(Float)
     is_gts_done = Column(Boolean, nullable=True)
+    warehouse = Column(String)
+    in_stock = Column(Boolean)
 
 # Define the Order model
 class Order(db.Model):
@@ -93,6 +96,7 @@ class Client(db.Model):
     comments = db.Column(db.String, nullable=True)
     email = db.Column(db.String, nullable=True)
     title = db.Column(db.String, nullable=False)
+    gts_number = db.Column(db.String, nullable=False)
 
 # Define the Order model
 class ClientOrder(db.Model):
@@ -112,6 +116,72 @@ class ClientOrder(db.Model):
     comments = db.Column(db.String(1000), nullable=True)
     delivery_status = db.Column(db.String(100), nullable=True)
     yield_type = db.Column(db.String(100), nullable=True)
+    intermediar_id = db.Column(db.String(100), nullable=True)
+    intermediar_amount = db.Column(db.Integer, nullable=True)
+    product_type = db.Column(db.String(50), nullable=True)
+
+@app.route('/stock/summary', methods=['GET'])
+def summarize_stock():
+    # Query: group by package_barcode and warehouse, aggregate amount and count
+    product_db = next(get_product_db())
+
+    grouped_results = (
+        product_db.query(
+            Product.package_barcode,
+            Product.warehouse,
+            func.sum(Product.amount).label('total_amount'),
+            func.count(Product.barcode).label('count')
+        )
+        .filter(Product.in_stock == True)
+        .group_by(Product.package_barcode, Product.warehouse)
+        .all()
+    )
+
+    # Build group list
+    group_summary = []
+    for package_barcode, warehouse, total_amount, count in grouped_results:
+        group_summary.append({
+            "package_barcode": package_barcode,
+            "warehouse": warehouse,
+            "total_amount": total_amount,
+            "count": count
+        })
+
+    # Optional overall summary
+    total_groups = len(group_summary)
+    total_amount_all = sum(item['total_amount'] for item in group_summary)
+
+    return jsonify({
+        "grouped_summary": group_summary,
+        "total_groups": total_groups,
+        "total_amount_all": total_amount_all
+    })
+
+@app.route('/stock/warehouse_summary', methods=['GET'])
+def summarize_stock_by_warehouse():
+    product_db = next(get_product_db())
+
+    # Group by warehouse only
+    results = (
+        product_db.query(
+            Product.warehouse,
+            func.count(Product.barcode).label('item_count'),
+            func.sum(Product.amount).label('total_amount')
+        )
+        .filter(Product.in_stock == True)
+        .group_by(Product.warehouse)
+        .all()
+    )
+
+    summary = []
+    for warehouse, item_count, total_amount in results:
+        summary.append({
+            "warehouse": warehouse,
+            "item_count": item_count,
+            "total_amount": total_amount
+        })
+
+    return jsonify(summary)
 
 @app.route('/export/orders', methods=['GET'])
 def export_orders():
@@ -126,6 +196,14 @@ def export_orders():
     for order in db_orders:
         client = Client.query.get(order.client_id)
         if client: 
+            gts_text = "Yapılmadı"
+            if order.is_gts_done == True:
+                gts_text = "OK"
+
+            receipt_text = "Yapılmadı"
+            if order.is_receipt_done == True:
+                receipt_text = "OK"
+
             data.append({
             "Sipariş Id": order.id,
             "İsim": client.name,
@@ -136,6 +214,9 @@ def export_orders():
             "Adres": client.address,
             "Email": client.email,
             "Miktar": order.quantity,
+            "Fatura": receipt_text,
+            "GTS": gts_text,
+            "GTS Barcode": order.gts_barcode,
             "Miktar Yazısı": order.quantity_text,
             "Fiyat": order.price,
             "Toplam Ücret": order.quantity * order.price,
@@ -165,6 +246,74 @@ def export_orders():
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
+def serialize_order(order):
+    return {
+        "id": order.id,
+        "clientId": order.client_id,
+        "quantity": order.quantity,
+        "quantityText": order.quantity_text,
+        "price": order.price,
+        "remainingAmount": order.remaining_amount,
+        "isReceiptDone": order.is_receipt_done,
+        "isGtsDone": order.is_gts_done,
+        "cargoBarcode": order.cargo_barcode,
+        "gtsBarcode": order.gts_barcode,
+        "orderType": order.order_type,
+        "lastUpdate": order.last_update,
+        "purchaseDate": order.purchase_date,
+        "comments": order.comments,
+        "deliveryStatus": order.delivery_status,
+        "yieldType": order.yield_type,
+        "intermediarId": order.intermediar_id,
+        "intermediarAmount": order.intermediar_amount,
+        "productType": order.product_type
+    }
+
+def serialize_client(client):
+    return {
+        "id": client.id,
+        "name": client.name,
+        "phoneNumber": client.phone_number,
+        "district": client.district,
+        "address": client.address,
+        "tc": client.tc,
+        "birthday": client.birthday,
+        "source": client.source,
+        "comments": client.comments,
+        "email": client.email,
+        "title": client.title,
+        "gtsNumber": client.gts_number
+    }
+
+@app.route('/orders/unpaid', methods=['GET'])
+def get_unpaid_orders():
+    orders = db.session.query(ClientOrder).all()
+    response = []
+
+    for order in orders:
+        # Ensure price and quantity are valid
+        if order.price is None or order.quantity is None:
+            continue
+
+        total_amount = order.price * order.quantity
+
+        paid_amount = db.session.query(
+            func.coalesce(func.sum(PaymentLog.amount), 0)
+        ).filter(PaymentLog.order_id == order.id).scalar()
+
+        remaining_amount = total_amount - paid_amount
+
+        # if remaining_amount > 0:
+        client = db.session.query(Client).filter(Client.id == order.client_id).first()
+        response.append({
+            "order": serialize_order(order),
+            "client": serialize_client(client),
+            "paid_amount": paid_amount,
+            "remaining_amount": remaining_amount
+        })
+
+    return jsonify(response)
+
 # Create the tables for both databases
 with app.app_context():
     db.create_all()
@@ -193,7 +342,8 @@ def save_client():
         source=data.get('source'),
         comments=data.get('comments'),
         email=data.get('email'),
-        title=data.get('title')
+        title=data.get('title'),
+        gts_number=data.get('gtsNumber')
     )
     db.session.add(new_client)
     db.session.commit()
@@ -207,7 +357,7 @@ def update_client(client_id):
 
     if not client:
         return jsonify({"message": "Client not found!"}), 404
-
+    print(data)
     # Update only the fields that are provided in the request using setattr
     for key, value in data.items():
         if hasattr(client, key):  # Check if the attribute exists
@@ -241,7 +391,8 @@ def get_clients():
         'birthday': client.birthday,
         'source': client.source,
         'comments': client.comments,
-        'title': client.title
+        'title': client.title,
+        'gtsNumber': client.gts_number
     } for client in clients])
 
 @app.route('/api/save_client_order', methods=['POST'])
@@ -263,7 +414,10 @@ def save_client_order():
         comments=data.get('comments'),
         delivery_status=data.get('deliveryStatus'),
         quantity_text=data.get('quantityText'),
-        yield_type=data.get('yieldType')
+        yield_type=data.get('yieldType'),
+        intermediar_id=data.get('intermediarId'),
+        intermediar_amount=data.get('intermediarAmount'),
+        productType=data.get('productType'),
     )
     
     db.session.add(new_order)
@@ -324,7 +478,10 @@ def get_client_orders():
                     "purchaseDate": order.purchase_date,
                     "comments": order.comments,
                     "deliveryStatus": order.delivery_status,
-                    "yieldType": order.yield_type
+                    "yieldType": order.yield_type,
+                    "intermediarId": order.intermediar_id,
+                    "intermediarAmount": order.intermediar_amount,
+                    "productType": order.product_type,
                 })
             clients.append({
                     "id": client.id,
@@ -337,7 +494,8 @@ def get_client_orders():
                     "source": client.source,
                     "comments": client.comments,
                     "email": client.email,
-                    "title": client.title
+                    "title": client.title,
+                    "gtsNumber": client.gts_number
                 })
 
     return jsonify({'orders': orders, 'clients': clients}), 200
@@ -366,7 +524,10 @@ def get_one_client_orders(client_id):
                     "purchaseDate": order.purchase_date,
                     "comments": order.comments,
                     "deliveryStatus": order.delivery_status,
-                    "yieldType": order.yield_type
+                    "yieldType": order.yield_type,
+                    "intermediarId": order.intermediar_id,
+                    "intermediarAmount": order.intermediar_amount,
+                    "productType": order.product_type,
                 })
 
     return jsonify(orders_list), 200
@@ -671,7 +832,9 @@ def get_product_details(barcode):
                     'end_date': p.end_date,
                     'order_id': p.order_id,
                     'amount': p.amount,
-                    'is_gts_done': p.is_gts_done
+                    'is_gts_done': p.is_gts_done,
+                    'warehouse': p.warehouse,
+                    'in_stock': p.in_stock
                 })
             return jsonify(product_list), 200
 
@@ -706,14 +869,19 @@ def get_all_products_grouped():
             products_data = []
             all_gts_done = all(p.is_gts_done for p in product_list)
             package_pending_amount = 0
-
+            warehouse = ""
+            in_stock = False
             for p in product_list:
                 products_data.append({
                     'barcode': p.barcode,
+                    'warehose': p.warehouse,
                     'order_id': p.order_id,
                     'is_gts_done': p.is_gts_done,
+                    'in_stock': p.in_stock,
                     'amount': p.amount,
                 })
+                warehouse = p.warehouse
+                in_stock = p.in_stock
                 total_products += 1
 
                 if p.is_gts_done:
@@ -728,6 +896,8 @@ def get_all_products_grouped():
             result.append({
                 'package_barcode': package_barcode,
                 'count': package_size,
+                'warehouse': warehouse,
+                'in_stock': in_stock,
                 'pending_amount': package_pending_amount,
                 'all_gts_done': all_gts_done,
                 'products': products_data
@@ -895,7 +1065,8 @@ def migrate_orders_to_clients_and_client_orders():
             source=order.source if order.source else "Unknown",
             comments=order.comments,
             email=order.email,
-            title="Müşteri"  # You can set a default title; adjust if needed
+            title="Müşteri",  # You can set a default title; adjust if needed
+            gts_number=""
         )
 
         try:
@@ -921,7 +1092,10 @@ def migrate_orders_to_clients_and_client_orders():
             last_update=order.last_update,
             purchase_date=order.purchase_date,
             comments=order.comments,
-            delivery_status=order.delivery_status
+            delivery_status=order.delivery_status,
+            intermediar_id=order.intermediar_id,
+            intermediar_amount=order.intermediar_amount,
+            product_type=order.product_type
         )
 
         db.session.add(client_order)

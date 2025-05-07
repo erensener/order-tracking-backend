@@ -31,6 +31,8 @@ class Product(Base):
     order_id = Column(String)
     amount = Column(Float)
     is_gts_done = Column(Boolean, nullable=True)
+    warehouse = Column(String)
+    in_stock = Column(Boolean, nullable=True)
 
 engine = create_engine(database_url)
 Base.metadata.create_all(engine)
@@ -63,7 +65,9 @@ def insert_or_update_product(db: SessionLocal, product_data: dict):
             end_date=product_data['Son Kullanma Tarihi'],
             order_id="",
             amount=0.25,
-            is_gts_done=False
+            is_gts_done=False,
+            warehouse="Ender",
+            in_stock=True
         )
         db.add(new_product)
     db.commit()
