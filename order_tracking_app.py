@@ -417,7 +417,7 @@ def save_client_order():
         yield_type=data.get('yieldType'),
         intermediar_id=data.get('intermediarId'),
         intermediar_amount=data.get('intermediarAmount'),
-        productType=data.get('productType'),
+        product_type=data.get('productType'),
     )
     
     db.session.add(new_order)
@@ -772,7 +772,7 @@ def delete_payment():
     if not payment:
         return jsonify({"error": "Payment not found"}), 404
     
-    order = Order.query.get(order_id)
+    order = ClientOrder.query.get(order_id)
     if not order:
         return jsonify({"error": "Order not found"}), 404
 
